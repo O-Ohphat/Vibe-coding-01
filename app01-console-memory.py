@@ -353,11 +353,11 @@ if __name__ == "__main__":
     if RUN_TEST_SUITE:
         suite = RiskAssessmentTestSuite(model_factory=PatientModel, service_class=ClinicalRiskService)
         suite.run_all_tiers()
-    
-    # Run in console with in-memory model
+
+    # Run in GUI with in-memory model
     db_model = PatientModel()
     rules_service = ClinicalRiskService()
-    ui_view = ConsoleView()
+
+    app = DiabetesRiskGUI(model=db_model, service=rules_service)
+    app.mainloop()
     
-    app = ConsoleController(model=db_model, service=rules_service, view=ui_view)
-    app.run()
