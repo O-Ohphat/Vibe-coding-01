@@ -1,5 +1,7 @@
 import statistics
 import time
+import tkinter as tk
+from tkinter import ttk, messagebox
 from typing import Dict, List, Optional, Tuple, Any
 
 # =====================================================================
@@ -78,105 +80,115 @@ class ClinicalRiskService:
 
 
 # =====================================================================
-# 3. PRESENTATION LAYER (VIEWS)
+# 3. PRESENTATION + ORCHESTRATION LAYER (GUI)
 # =====================================================================
-class ConsoleView:
-    """Handles system layout, user text inputs, and structured reports for terminal."""
-    
-    @staticmethod
-    def display_main_menu() -> str:
-        print("\n" + "="*40 + "\n     DIABETES RISK SCORING SYSTEM\n" + "="*40)
-        print("1. Assess Patient Risk\n2. Exit\n" + "-"*40)
-        return input("Select an option (1-2): ").strip()
+class DiabetesRiskGUI(tk.Tk):
+    """Tkinter GUI window providing patient selection, metric editing, and
+    diagnostic reporting, while delegating all rules/data logic to
+    PatientModel and ClinicalRiskService."""
 
-    @staticmethod
-    def display_patient_ids(ids: List[int]) -> None:
-        print(f"\nAvailable Patient IDs: {', '.join(map(str, ids))}")
-
-    @staticmethod
-    def prompt_patient_id() -> str:
-        return input("Enter Patient ID to assess: ").strip()
-
-    @staticmethod
-    def display_error(message: str) -> None:
-        print(f"\n[ERROR] {message}")
-
-    @staticmethod
-    def display_profile(patient_id: int, metrics: Dict[str, float]) -> None:
-        print(f"\n--- Clinical Profile for Patient {patient_id} ---")
-        for metric, val in metrics.items():
-            print(f" * {metric}: {val}")
-
-    @staticmethod
-    def prompt_modification_choice() -> bool:
-        return input("\nDo you want to modify any metrics before calculation? (y/n): ").strip().lower() == 'y'
-
-    @staticmethod
-    def prompt_metric_update(metric_name: str, current_value: float) -> float:
-        user_input = input(f"Enter new {metric_name} [Current: {current_value}] (Or press Enter to keep): ").strip()
-        if user_input == "":
-            return current_value
-        try:
-            return float(user_input)
-        except ValueError:
-            print("[Invalid Input] Keeping original value.")
-            return current_value
-
-    @staticmethod
-    def display_diagnostic_report(patient_id: int, score: int, category: str) -> None:
-        print("\n" + "*"*40 + "\n          DIAGNOSTIC RISK REPORT\n" + "*"*40)
-        print(f" Patient ID:       {patient_id}\n Cumulative Score: {score} pts\n Risk Category:    {category.upper()}")
-        print("*"*40)
-
-
-# =====================================================================
-# 4. ORCHESTRATION LAYER (CONTROLLER)
-# =====================================================================
-class ConsoleController:
-    """Coordinates interaction workflows between Model, Service, and Console View."""
-    
-    def __init__(self, model: Any, service: ClinicalRiskService, view: ConsoleView):
+    def __init__(self, model: Any, service: ClinicalRiskService):
+        super().__init__()
         self.model = model
         self.service = service
-        self.view = view
+        self.current_patient_id: Optional[int] = None
+        self.metric_vars: Dict[str, tk.StringVar] = {}
 
-    def run(self) -> None:
-        while True:
-            choice = self.view.display_main_menu()
-            if choice == "1":
-                self.handle_assessment_workflow()
-            elif choice == "2":
-                print("\nExiting system. Goodbye.")
-                break
-            else:
-                self.view.display_error("Invalid menu selection. Please choose 1 or 2.")
+        self.title("Diabetes Risk Scoring System")
+        self.geometry("480x580")
+        self.resizable(False, False)
 
-    def handle_assessment_workflow(self) -> None:
-        valid_ids = self.model.get_all_ids()
-        self.view.display_patient_ids(valid_ids)
-        
-        id_input = self.view.prompt_patient_id()
-        if not id_input.isdigit():
-            self.view.display_error("Patient ID must be a numeric integer value.")
+        self._build_layout()
+        self._refresh_patient_list()
+
+    def _build_layout(self) -> None:
+        tk.Label(self, text="DIABETES RISK SCORING SYSTEM", font=("Segoe UI", 14, "bold")).pack(pady=10)
+
+        selector_frame = tk.Frame(self)
+        selector_frame.pack(pady=5, fill="x", padx=15)
+        tk.Label(selector_frame, text="Patient ID:").pack(side="left")
+        self.patient_combo = ttk.Combobox(selector_frame, state="readonly", width=15)
+        self.patient_combo.pack(side="left", padx=8)
+        tk.Button(selector_frame, text="Load Patient", command=self.load_selected_patient).pack(side="left", padx=5)
+
+        self.metrics_frame = tk.LabelFrame(self, text="Clinical Metrics")
+        self.metrics_frame.pack(pady=10, padx=15, fill="x")
+        for metric in ("Glucose", "BMI", "Age", "BloodPressure"):
+            row = tk.Frame(self.metrics_frame)
+            row.pack(fill="x", padx=10, pady=4)
+            tk.Label(row, text=f"{metric}:", width=14, anchor="w").pack(side="left")
+            var = tk.StringVar()
+            tk.Entry(row, textvariable=var, width=15).pack(side="left")
+            self.metric_vars[metric] = var
+
+        action_frame = tk.Frame(self)
+        action_frame.pack(pady=10)
+        tk.Button(action_frame, text="Save Changes", command=self.save_metric_changes).pack(side="left", padx=5)
+        tk.Button(action_frame, text="Calculate Risk", command=self.calculate_risk).pack(side="left", padx=5)
+
+        self.report_panel = tk.Text(self, height=10, width=52, state="disabled", bg="#f5f5f5")
+        self.report_panel.pack(pady=10, padx=15)
+
+    def _refresh_patient_list(self) -> None:
+        ids = self.model.get_all_ids()
+        self.patient_combo["values"] = ids
+        if ids:
+            self.patient_combo.current(0)
+            self.load_selected_patient()
+
+    def load_selected_patient(self) -> None:
+        selection = self.patient_combo.get()
+        if not selection:
+            messagebox.showerror("Error", "No patient selected.")
             return
-            
-        patient_id = int(id_input)
-        patient_metrics = self.model.get_patient(patient_id)
-        if not patient_metrics:
-            self.view.display_error(f"Patient ID {patient_id} does not exist in the database.")
+        patient_id = int(selection)
+        metrics = self.model.get_patient(patient_id)
+        if not metrics:
+            messagebox.showerror("Error", f"Patient ID {patient_id} does not exist in the database.")
             return
+        self.current_patient_id = patient_id
+        for metric, value in metrics.items():
+            self.metric_vars[metric].set(str(value))
+        self._clear_report()
 
-        self.view.display_profile(patient_id, patient_metrics)
-        
-        if self.view.prompt_modification_choice():
-            updated_metrics = {}
-            for metric, current_val in patient_metrics.items():
-                updated_metrics[metric] = self.view.prompt_metric_update(metric, current_val)
-            self.model.update_patient(patient_id, updated_metrics)
-            patient_metrics = updated_metrics 
+    def save_metric_changes(self) -> None:
+        if self.current_patient_id is None:
+            messagebox.showerror("Error", "Load a patient before saving changes.")
+            return
+        current = self.model.get_patient(self.current_patient_id)
+        updated_metrics = {}
+        for metric, var in self.metric_vars.items():
+            try:
+                updated_metrics[metric] = float(var.get())
+            except ValueError:
+                messagebox.showwarning("Invalid Input", f"'{var.get()}' is not a valid number for {metric}. Keeping original value.")
+                updated_metrics[metric] = current[metric]
+                var.set(str(current[metric]))
+        self.model.update_patient(self.current_patient_id, updated_metrics)
+        messagebox.showinfo("Saved", "Patient metrics updated successfully.")
 
-        score, category = self.service.evaluate_patient_risk(patient_metrics)
-        self.view.display_diagnostic_report(patient_id, score, category)
+    def calculate_risk(self) -> None:
+        if self.current_patient_id is None:
+            messagebox.showerror("Error", "Load a patient before calculating risk.")
+            return
+        metrics = self.model.get_patient(self.current_patient_id)
+        score, category = self.service.evaluate_patient_risk(metrics)
+        self._display_report(self.current_patient_id, score, category)
+
+    def _display_report(self, patient_id: int, score: int, category: str) -> None:
+        self.report_panel.configure(state="normal")
+        self.report_panel.delete("1.0", tk.END)
+        self.report_panel.insert(tk.END, "*"*40 + "\n          DIAGNOSTIC RISK REPORT\n" + "*"*40 + "\n")
+        self.report_panel.insert(tk.END, f" Patient ID:       {patient_id}\n")
+        self.report_panel.insert(tk.END, f" Cumulative Score: {score} pts\n")
+        self.report_panel.insert(tk.END, f" Risk Category:    {category.upper()}\n")
+        self.report_panel.insert(tk.END, "*"*40)
+        self.report_panel.configure(state="disabled")
+
+    def _clear_report(self) -> None:
+        self.report_panel.configure(state="normal")
+        self.report_panel.delete("1.0", tk.END)
+        self.report_panel.configure(state="disabled")
 
 
 # =====================================================================
@@ -294,10 +306,9 @@ if __name__ == "__main__":
         suite = RiskAssessmentTestSuite(model_factory=PatientModel, service_class=ClinicalRiskService)
         suite.run_all_tiers()
     
-    # Run in console with in-memory model
+    # Run in GUI with in-memory model
     db_model = PatientModel()
     rules_service = ClinicalRiskService()
-    ui_view = ConsoleView()
-    
-    app = ConsoleController(model=db_model, service=rules_service, view=ui_view)
-    app.run()
+
+    app = DiabetesRiskGUI(model=db_model, service=rules_service)
+    app.mainloop()
