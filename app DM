@@ -1,0 +1,609 @@
+"""
+====================================================================
+ DIABETES RISK SCORING SYSTEM
+ 4-Tier Architecture: Data Access -> Business Logic -> Presentation -> Controller
+====================================================================
+
+Layers:
+    1. Data Access Layer   -> PatientRepository   (raw data + cleanup)
+    2. Business Logic Layer-> RiskScoringService   (pure clinical rules)
+    3. Presentation Layer  -> ConsoleView          (I/O, no business logic)
+    4. Orchestration Layer -> RiskAssessmentController (workflow glue)
+
+Toggle RUN_TEST_SUITE below to switch between running the automated
+test suite and launching the interactive console application.
+====================================================================
+"""
+
+from __future__ import annotations
+
+import statistics
+import time
+import unittest
+from dataclasses import dataclass, replace
+from io import StringIO
+from typing import Dict, List, Optional
+from unittest.mock import patch
+
+# ====================================================================
+# GLOBAL SWITCH
+# ====================================================================
+# True  -> run the 3-tier automated test suite
+# False -> launch the interactive console application
+RUN_TEST_SUITE = False
+
+
+# ====================================================================
+# 1. DATA ACCESS LAYER (THE MODEL)
+# ====================================================================
+# Responsible only for holding raw data and performing basic, non-clinical
+# data cleanup (e.g. fixing obviously missing/invalid values). It knows
+# NOTHING about risk scoring rules.
+
+@dataclass
+class PatientRecord:
+    """A plain data container for a single patient's clinical metrics."""
+    patient_id: int
+    name: str
+    glucose: float
+    bmi: float
+    age: int
+    blood_pressure: float
+
+
+class PatientRepository:
+    """Data Access Layer: owns the patient dataset and its integrity."""
+
+    def __init__(self, seed_data: Optional[List[PatientRecord]] = None):
+        # Use provided seed data or fall back to the built-in mock dataset.
+        self._patients: Dict[int, PatientRecord] = {}
+        records = seed_data if seed_data is not None else self._build_mock_data()
+        for record in records:
+            self._patients[record.patient_id] = record
+        self._clean_missing_bmi()
+
+    @staticmethod
+    def _build_mock_data() -> List[PatientRecord]:
+        """4 sample patients. Note patient 3 has BMI = 0 (missing/invalid)."""
+        return [
+            PatientRecord(patient_id=1, name="Somchai P.", glucose=95, bmi=24.5, age=38, blood_pressure=76),
+            PatientRecord(patient_id=2, name="Malee S.", glucose=132, bmi=31.2, age=57, blood_pressure=88),
+            PatientRecord(patient_id=3, name="Anong T.", glucose=118, bmi=0, age=66, blood_pressure=92),
+            PatientRecord(patient_id=4, name="Wichai K.", glucose=101, bmi=27.8, age=45, blood_pressure=80),
+        ]
+
+    def _clean_missing_bmi(self) -> None:
+        """
+        Data cleanup rule: if a patient's BMI is 0 (missing/invalid),
+        replace it with the median BMI of the OTHER patients (those with
+        a valid, non-zero BMI).
+        """
+        valid_bmis = [p.bmi for p in self._patients.values() if p.bmi != 0]
+        if not valid_bmis:
+            return  # Nothing to impute from; leave as-is.
+
+        median_bmi = statistics.median(valid_bmis)
+        for patient_id, patient in self._patients.items():
+            if patient.bmi == 0:
+                self._patients[patient_id] = replace(patient, bmi=median_bmi)
+
+    # ---- Public read/write API used by upper layers -----------------
+
+    def get_all_patient_ids(self) -> List[int]:
+        return sorted(self._patients.keys())
+
+    def get_patient(self, patient_id: int) -> Optional[PatientRecord]:
+        return self._patients.get(patient_id)
+
+    def update_patient(self, patient_id: int, **changes) -> Optional[PatientRecord]:
+        """Update one or more fields of a patient record and persist it."""
+        existing = self._patients.get(patient_id)
+        if existing is None:
+            return None
+        updated = replace(existing, **changes)
+        self._patients[patient_id] = updated
+        return updated
+
+
+# ====================================================================
+# 2. BUSINESS LOGIC LAYER (THE SERVICE)
+# ====================================================================
+# Pure clinical decision rules. No print(), no input(), no knowledge of
+# the repository's internals -- only operates on plain values / records.
+
+class RiskScoringService:
+    """Business Logic Layer: clinical scoring & risk categorization rules."""
+
+    # Score bucket definitions, expressed as (label, points) thresholds.
+    # Each metric contributes 0 (Low), 1 (Medium), or 2 (High) points.
+
+    @staticmethod
+    def score_glucose(glucose: float) -> int:
+        if glucose < 100:
+            return 0   # Low  (normal fasting glucose)
+        elif glucose <= 125:
+            return 1   # Medium (pre-diabetic range)
+        else:
+            return 2   # High (diabetic range, >=126)
+
+    @staticmethod
+    def score_bmi(bmi: float) -> int:
+        if bmi < 25:
+            return 0   # Low  (normal weight)
+        elif bmi <= 29.9:
+            return 1   # Medium (overweight)
+        else:
+            return 2   # High (obese, >=30)
+
+    @staticmethod
+    def score_age(age: int) -> int:
+        if age < 45:
+            return 0   # Low
+        elif age <= 64:
+            return 1   # Medium
+        else:
+            return 2   # High (>=65)
+
+    @staticmethod
+    def score_blood_pressure(bp: float) -> int:
+        if bp < 80:
+            return 0   # Low  (normal diastolic)
+        elif bp <= 89:
+            return 1   # Medium (elevated / stage 1)
+        else:
+            return 2   # High (>=90, stage 2 hypertension)
+
+    @classmethod
+    def calculate_component_scores(cls, patient: PatientRecord) -> Dict[str, int]:
+        """Return the individual per-metric scores for transparency in the report."""
+        return {
+            "Glucose": cls.score_glucose(patient.glucose),
+            "BMI": cls.score_bmi(patient.bmi),
+            "Age": cls.score_age(patient.age),
+            "BloodPressure": cls.score_blood_pressure(patient.blood_pressure),
+        }
+
+    @classmethod
+    def calculate_total_score(cls, patient: PatientRecord) -> int:
+        return sum(cls.calculate_component_scores(patient).values())
+
+    @staticmethod
+    def categorize_risk(total_score: int) -> str:
+        if total_score <= 2:
+            return "Low Risk"
+        elif total_score <= 5:
+            return "Moderate Risk"
+        else:
+            return "High Risk"
+
+    @classmethod
+    def generate_report(cls, patient: PatientRecord) -> dict:
+        """Bundle everything the presentation layer needs into one structure."""
+        component_scores = cls.calculate_component_scores(patient)
+        total_score = sum(component_scores.values())
+        category = cls.categorize_risk(total_score)
+        return {
+            "patient": patient,
+            "component_scores": component_scores,
+            "total_score": total_score,
+            "category": category,
+        }
+
+
+# ====================================================================
+# 3. PRESENTATION LAYER (THE VIEW)
+# ====================================================================
+# Handles ALL console I/O. Contains no clinical logic and no direct
+# access to the repository's storage -- it only receives/returns
+# plain data passed to it by the controller.
+
+class ConsoleView:
+    """Presentation Layer: displays menus/reports and captures raw input."""
+
+    # ---- Output methods ----------------------------------------------
+
+    def show_main_menu(self) -> None:
+        print("\n" + "=" * 50)
+        print(" DIABETES RISK SCORING SYSTEM - MAIN MENU")
+        print("=" * 50)
+        print("1. Assess Patient Risk")
+        print("2. Exit")
+
+    def show_patient_list(self, patient_ids: List[int]) -> None:
+        print("\nAvailable Patient IDs:", ", ".join(str(pid) for pid in patient_ids))
+
+    def show_error(self, message: str) -> None:
+        print(f"[ERROR] {message}")
+
+    def show_message(self, message: str) -> None:
+        print(message)
+
+    def show_patient_profile(self, patient: PatientRecord) -> None:
+        print(f"\n--- Current Clinical Profile: {patient.name} (ID: {patient.patient_id}) ---")
+        print(f"  Glucose        : {patient.glucose} mg/dL")
+        print(f"  BMI            : {patient.bmi:.1f}")
+        print(f"  Age            : {patient.age} years")
+        print(f"  Blood Pressure : {patient.blood_pressure} mmHg (diastolic)")
+
+    def show_risk_report(self, report: dict) -> None:
+        patient = report["patient"]
+        scores = report["component_scores"]
+        print("\n" + "-" * 50)
+        print(f" DIAGNOSTIC RISK REPORT - {patient.name} (ID: {patient.patient_id})")
+        print("-" * 50)
+        print(f"  Glucose score        : {scores['Glucose']}")
+        print(f"  BMI score            : {scores['BMI']}")
+        print(f"  Age score            : {scores['Age']}")
+        print(f"  Blood Pressure score : {scores['BloodPressure']}")
+        print(f"  {'-' * 30}")
+        print(f"  TOTAL SCORE          : {report['total_score']}")
+        print(f"  RISK CATEGORY        : {report['category']}")
+        print("-" * 50)
+
+    # ---- Input methods -------------------------------------------------
+
+    def prompt_menu_choice(self) -> str:
+        return input("Select an option (1-2): ").strip()
+
+    def prompt_patient_id(self) -> str:
+        return input("Enter Patient ID to assess: ").strip()
+
+    def prompt_yes_no(self, question: str) -> bool:
+        answer = input(f"{question} (y/n): ").strip().lower()
+        return answer == "y"
+
+    def prompt_new_metrics(self, patient: PatientRecord) -> dict:
+        """
+        Ask the user for replacement values for each metric.
+        Pressing Enter (empty input) keeps the current value.
+        Returns a dict of only the fields that actually changed.
+        """
+        changes = {}
+        print("Press Enter to keep the current value.")
+
+        raw = input(f"  Glucose [{patient.glucose}]: ").strip()
+        if raw:
+            changes["glucose"] = float(raw)
+
+        raw = input(f"  BMI [{patient.bmi:.1f}]: ").strip()
+        if raw:
+            changes["bmi"] = float(raw)
+
+        raw = input(f"  Age [{patient.age}]: ").strip()
+        if raw:
+            changes["age"] = int(raw)
+
+        raw = input(f"  Blood Pressure [{patient.blood_pressure}]: ").strip()
+        if raw:
+            changes["blood_pressure"] = float(raw)
+
+        return changes
+
+    def show_goodbye(self) -> None:
+        print("\nExiting Diabetes Risk Scoring System. Goodbye.")
+
+
+# ====================================================================
+# 4. ORCHESTRATION LAYER (THE CONTROLLER)
+# ====================================================================
+# Coordinates the Model, Service, and View. Contains workflow/sequencing
+# logic only -- no clinical rules, no raw data storage, no print/input
+# calls of its own.
+
+class RiskAssessmentController:
+    """Orchestration Layer: drives the application workflow."""
+
+    def __init__(self, repository: PatientRepository, service: type[RiskScoringService], view: ConsoleView):
+        self.repository = repository
+        self.service = service
+        self.view = view
+
+    def run(self) -> None:
+        """Main application loop (Core Workflow 01 & 02)."""
+        while True:
+            self.view.show_main_menu()
+            choice = self.view.prompt_menu_choice()
+
+            if choice == "1":
+                self._handle_assess_patient_workflow()
+            elif choice == "2":
+                self.view.show_goodbye()
+                break
+            else:
+                self.view.show_error("Invalid menu option. Please choose 1 or 2.")
+
+    def _handle_assess_patient_workflow(self) -> None:
+        """Full single-patient assessment flow, steps 2-6 of Workflow 01."""
+        # Step 2: show valid IDs
+        self.view.show_patient_list(self.repository.get_all_patient_ids())
+
+        # Step 3: capture & validate ID selection
+        raw_id = self.view.prompt_patient_id()
+        if not raw_id.isdigit():
+            self.view.show_error("Patient ID must be a number.")
+            return
+
+        patient_id = int(raw_id)
+        patient = self.repository.get_patient(patient_id)
+        if patient is None:
+            self.view.show_error(f"No patient found with ID {patient_id}.")
+            return
+
+        # Step 4: display current profile
+        self.view.show_patient_profile(patient)
+
+        # Step 5: optionally modify metrics
+        if self.view.prompt_yes_no("Modify any metrics before scoring?"):
+            changes = self.view.prompt_new_metrics(patient)
+            if changes:
+                patient = self.repository.update_patient(patient_id, **changes)
+                self.view.show_message("Patient data updated.")
+                self.view.show_patient_profile(patient)
+
+        # Step 6: calculate score and display report
+        report = self.service.generate_report(patient)
+        self.view.show_risk_report(report)
+
+
+# ====================================================================
+# APPLICATION ENTRY POINT (interactive mode)
+# ====================================================================
+
+def launch_application() -> None:
+    repository = PatientRepository()
+    view = ConsoleView()
+    controller = RiskAssessmentController(repository, RiskScoringService, view)
+    controller.run()
+
+
+# ====================================================================
+# 3-TIER AUTOMATED TEST SUITE
+# ====================================================================
+# Tier 1: Unit Tests        -> isolated correctness of each layer
+# Tier 2: End-to-End Tests  -> simulated user journey across all 4 layers
+# Tier 3: Performance Tests -> benchmark scoring throughput/latency
+# ====================================================================
+
+
+# ---- Tier 1: Unit Tests --------------------------------------------
+
+class UnitTests_DataAccessLayer(unittest.TestCase):
+    """Verifies PatientRepository storage & data-cleaning behaviour."""
+
+    def test_mock_data_loads_four_patients(self):
+        repo = PatientRepository()
+        self.assertEqual(len(repo.get_all_patient_ids()), 4)
+
+    def test_zero_bmi_is_replaced_with_median_of_others(self):
+        # Craft controlled data: one patient has BMI 0, others are 20, 30, 40
+        # -> median of [20, 30, 40] = 30
+        data = [
+            PatientRecord(1, "A", glucose=90, bmi=20, age=30, blood_pressure=70),
+            PatientRecord(2, "B", glucose=90, bmi=30, age=30, blood_pressure=70),
+            PatientRecord(3, "C", glucose=90, bmi=40, age=30, blood_pressure=70),
+            PatientRecord(4, "D", glucose=90, bmi=0, age=30, blood_pressure=70),
+        ]
+        repo = PatientRepository(seed_data=data)
+        self.assertEqual(repo.get_patient(4).bmi, 30)
+
+    def test_nonzero_bmi_values_are_untouched(self):
+        repo = PatientRepository()
+        self.assertEqual(repo.get_patient(1).bmi, 24.5)
+
+    def test_get_patient_returns_none_for_unknown_id(self):
+        repo = PatientRepository()
+        self.assertIsNone(repo.get_patient(999))
+
+    def test_update_patient_persists_changes(self):
+        repo = PatientRepository()
+        updated = repo.update_patient(1, glucose=150)
+        self.assertEqual(updated.glucose, 150)
+        self.assertEqual(repo.get_patient(1).glucose, 150)
+
+    def test_update_unknown_patient_returns_none(self):
+        repo = PatientRepository()
+        self.assertIsNone(repo.update_patient(999, glucose=100))
+
+
+class UnitTests_BusinessLogicLayer(unittest.TestCase):
+    """Verifies RiskScoringService scoring & categorization rules, including boundaries."""
+
+    def test_glucose_scoring_boundaries(self):
+        self.assertEqual(RiskScoringService.score_glucose(99), 0)
+        self.assertEqual(RiskScoringService.score_glucose(100), 1)
+        self.assertEqual(RiskScoringService.score_glucose(125), 1)
+        self.assertEqual(RiskScoringService.score_glucose(126), 2)
+
+    def test_bmi_scoring_boundaries(self):
+        self.assertEqual(RiskScoringService.score_bmi(24.9), 0)
+        self.assertEqual(RiskScoringService.score_bmi(25), 1)
+        self.assertEqual(RiskScoringService.score_bmi(29.9), 1)
+        self.assertEqual(RiskScoringService.score_bmi(30), 2)
+
+    def test_age_scoring_boundaries(self):
+        self.assertEqual(RiskScoringService.score_age(44), 0)
+        self.assertEqual(RiskScoringService.score_age(45), 1)
+        self.assertEqual(RiskScoringService.score_age(64), 1)
+        self.assertEqual(RiskScoringService.score_age(65), 2)
+
+    def test_blood_pressure_scoring_boundaries(self):
+        self.assertEqual(RiskScoringService.score_blood_pressure(79), 0)
+        self.assertEqual(RiskScoringService.score_blood_pressure(80), 1)
+        self.assertEqual(RiskScoringService.score_blood_pressure(89), 1)
+        self.assertEqual(RiskScoringService.score_blood_pressure(90), 2)
+
+    def test_total_score_sums_all_components(self):
+        patient = PatientRecord(1, "Test", glucose=126, bmi=30, age=65, blood_pressure=90)
+        # All four metrics score "High" (2) -> total = 8
+        self.assertEqual(RiskScoringService.calculate_total_score(patient), 8)
+
+    def test_risk_categorization_boundaries(self):
+        self.assertEqual(RiskScoringService.categorize_risk(0), "Low Risk")
+        self.assertEqual(RiskScoringService.categorize_risk(2), "Low Risk")
+        self.assertEqual(RiskScoringService.categorize_risk(3), "Moderate Risk")
+        self.assertEqual(RiskScoringService.categorize_risk(5), "Moderate Risk")
+        self.assertEqual(RiskScoringService.categorize_risk(6), "High Risk")
+        self.assertEqual(RiskScoringService.categorize_risk(8), "High Risk")
+
+    def test_generate_report_structure(self):
+        patient = PatientRecord(1, "Test", glucose=90, bmi=22, age=30, blood_pressure=70)
+        report = RiskScoringService.generate_report(patient)
+        self.assertEqual(report["total_score"], 0)
+        self.assertEqual(report["category"], "Low Risk")
+        self.assertEqual(len(report["component_scores"]), 4)
+
+
+# ---- Tier 2: End-to-End Tests ---------------------------------------
+
+class EndToEndTests_FullUserJourney(unittest.TestCase):
+    """
+    Simulates a real user driving the console app through all 4 layers:
+    Controller -> View (input) -> Model (lookup/update) -> Service (score)
+    -> View (output). Verifies the layers integrate correctly.
+    """
+
+    def _run_scripted_session(self, scripted_inputs: List[str]) -> str:
+        """Runs the controller with mocked stdin/stdout and returns captured output."""
+        repository = PatientRepository()
+        view = ConsoleView()
+        controller = RiskAssessmentController(repository, RiskScoringService, view)
+
+        captured_output = StringIO()
+        with patch("builtins.input", side_effect=scripted_inputs), \
+             patch("sys.stdout", new=captured_output):
+            controller.run()
+
+        return captured_output.getvalue()
+
+    def test_full_journey_assess_without_modification(self):
+        # Journey: main menu -> assess -> pick patient 1 -> no modification -> exit
+        scripted_inputs = [
+            "1",       # main menu: Assess Patient Risk
+            "1",       # select patient ID 1
+            "n",       # do not modify metrics
+            "2",       # main menu: Exit
+        ]
+        output = self._run_scripted_session(scripted_inputs)
+
+        self.assertIn("Current Clinical Profile: Somchai P.", output)
+        self.assertIn("DIAGNOSTIC RISK REPORT", output)
+        self.assertIn("RISK CATEGORY", output)
+        self.assertIn("Goodbye", output)
+
+    def test_full_journey_assess_with_modification_changes_score(self):
+        # Journey: assess patient 4, bump glucose/bmi/age/bp into "High" bucket, verify report reflects it
+        scripted_inputs = [
+            "1",       # Assess Patient Risk
+            "4",       # select patient ID 4
+            "y",       # yes, modify metrics
+            "180",     # glucose -> High
+            "35",      # bmi -> High
+            "70",      # age -> High
+            "95",      # blood pressure -> High
+            "2",       # Exit
+        ]
+        output = self._run_scripted_session(scripted_inputs)
+
+        self.assertIn("Patient data updated.", output)
+        self.assertIn("TOTAL SCORE          : 8", output)
+        self.assertIn("RISK CATEGORY        : High Risk", output)
+
+    def test_full_journey_invalid_patient_id_shows_error(self):
+        scripted_inputs = [
+            "1",       # Assess Patient Risk
+            "999",     # invalid ID
+            "2",       # Exit
+        ]
+        output = self._run_scripted_session(scripted_inputs)
+        self.assertIn("No patient found with ID 999", output)
+
+    def test_full_journey_non_numeric_id_shows_error(self):
+        scripted_inputs = [
+            "1",        # Assess Patient Risk
+            "abc",      # non-numeric ID
+            "2",        # Exit
+        ]
+        output = self._run_scripted_session(scripted_inputs)
+        self.assertIn("Patient ID must be a number", output)
+
+    def test_full_journey_invalid_menu_choice_shows_error(self):
+        scripted_inputs = [
+            "9",   # invalid main menu option
+            "2",   # Exit
+        ]
+        output = self._run_scripted_session(scripted_inputs)
+        self.assertIn("Invalid menu option", output)
+
+
+# ---- Tier 3: Performance Tests ---------------------------------------
+
+class PerformanceTests_ScoringBenchmark(unittest.TestCase):
+    """
+    Benchmarks the scoring pipeline's throughput/latency. Not a strict
+    pass/fail clinical test -- primarily logs timing data, with a loose
+    upper-bound sanity assertion to catch severe performance regressions.
+    """
+
+    ITERATIONS = 10_000
+    MAX_ACCEPTABLE_AVG_SECONDS = 0.001  # generous ceiling: 1ms/op
+
+    def test_single_patient_scoring_benchmark(self):
+        patient = PatientRecord(1, "Benchmark", glucose=140, bmi=32, age=55, blood_pressure=88)
+
+        start = time.perf_counter()
+        for _ in range(self.ITERATIONS):
+            RiskScoringService.generate_report(patient)
+        elapsed = time.perf_counter() - start
+
+        avg_per_op = elapsed / self.ITERATIONS
+        print(f"\n[PERF] {self.ITERATIONS} scoring runs in {elapsed:.4f}s "
+              f"(avg {avg_per_op * 1000:.5f} ms/op)")
+
+        self.assertLess(avg_per_op, self.MAX_ACCEPTABLE_AVG_SECONDS,
+                         "Average scoring time exceeded acceptable threshold.")
+
+    def test_full_repository_batch_scoring_benchmark(self):
+        """Benchmark scoring all patients in the repository repeatedly (simulates batch/report runs)."""
+        repository = PatientRepository()
+        patient_ids = repository.get_all_patient_ids()
+        batches = 2_000
+
+        start = time.perf_counter()
+        for _ in range(batches):
+            for pid in patient_ids:
+                patient = repository.get_patient(pid)
+                RiskScoringService.generate_report(patient)
+        elapsed = time.perf_counter() - start
+
+        total_ops = batches * len(patient_ids)
+        avg_per_op = elapsed / total_ops
+        print(f"[PERF] {total_ops} batch scoring ops in {elapsed:.4f}s "
+              f"(avg {avg_per_op * 1000:.5f} ms/op)")
+
+        self.assertLess(avg_per_op, self.MAX_ACCEPTABLE_AVG_SECONDS,
+                         "Average batch scoring time exceeded acceptable threshold.")
+
+
+def run_test_suite() -> None:
+    """Discovers and runs all Unit / E2E / Performance tests with verbose output."""
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+
+    suite.addTests(loader.loadTestsFromTestCase(UnitTests_DataAccessLayer))
+    suite.addTests(loader.loadTestsFromTestCase(UnitTests_BusinessLogicLayer))
+    suite.addTests(loader.loadTestsFromTestCase(EndToEndTests_FullUserJourney))
+    suite.addTests(loader.loadTestsFromTestCase(PerformanceTests_ScoringBenchmark))
+
+    runner = unittest.TextTestRunner(verbosity=2)
+    runner.run(suite)
+
+
+# ====================================================================
+# MAIN ENTRY POINT
+# ====================================================================
+
+if __name__ == "__main__":
+    if RUN_TEST_SUITE:
+        run_test_suite()
+    else:
+        launch_application()
