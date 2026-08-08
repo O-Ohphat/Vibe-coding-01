@@ -1,44 +1,122 @@
 import statistics
 import time
 from typing import Dict, List, Optional, Tuple, Any
+import sqlite3
+from typing import Dict, List, Optional
+from pathlib import Path
 
 import streamlit as st
 
 # =====================================================================
 # 1. DATA ACCESS LAYER (MODELS) - UNCHANGED BUSINESS LOGIC
 # =====================================================================
-class PatientModel:
-    """Manages volatile in-memory patient data storage and initial data cleaning."""
 
-    def __init__(self):
-        self._raw_patients: Dict[int, Dict[str, float]] = {
-            101: {"Glucose": 95.0, "BMI": 22.5, "Age": 28.0, "BloodPressure": 115.0},
-            102: {"Glucose": 145.0, "BMI": 0.0, "Age": 54.0, "BloodPressure": 135.0},
-            103: {"Glucose": 112.0, "BMI": 29.1, "Age": 42.0, "BloodPressure": 122.0},
-            104: {"Glucose": 180.0, "BMI": 36.4, "Age": 61.0, "BloodPressure": 142.0}
-        }
+class PatientModel:
+    """Manages persistent patient data storage (SQLite) and initial data cleaning."""
+
+    DB_PATH = Path("patients.db")
+
+    _SEED_DATA: Dict[int, Dict[str, float]] = {
+        101: {"Glucose": 95.0, "BMI": 22.5, "Age": 28.0, "BloodPressure": 115.0},
+        102: {"Glucose": 145.0, "BMI": 0.0, "Age": 54.0, "BloodPressure": 135.0},
+        103: {"Glucose": 112.0, "BMI": 29.1, "Age": 42.0, "BloodPressure": 122.0},
+        104: {"Glucose": 180.0, "BMI": 36.4, "Age": 61.0, "BloodPressure": 142.0},
+    }
+
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = str(db_path) if db_path else str(self.DB_PATH)
+        self._init_db()
+        self._seed_if_empty()
         self._clean_initial_data()
 
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS patients (
+                    patient_id INTEGER PRIMARY KEY,
+                    Glucose REAL NOT NULL,
+                    BMI REAL NOT NULL,
+                    Age REAL NOT NULL,
+                    BloodPressure REAL NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+    def _seed_if_empty(self) -> None:
+        with self._get_connection() as conn:
+            count = conn.execute("SELECT COUNT(*) AS c FROM patients").fetchone()["c"]
+            if count == 0:
+                conn.executemany(
+                    """
+                    INSERT INTO patients (patient_id, Glucose, BMI, Age, BloodPressure)
+                    VALUES (:id, :Glucose, :BMI, :Age, :BloodPressure)
+                    """,
+                    [
+                        {"id": pid, **metrics}
+                        for pid, metrics in self._SEED_DATA.items()
+                    ],
+                )
+                conn.commit()
+
     def _clean_initial_data(self) -> None:
-        valid_bmis = [p["BMI"] for p in self._raw_patients.values() if p["BMI"] > 0]
-        median_bmi = statistics.median(valid_bmis) if valid_bmis else 25.0
-        for metrics in self._raw_patients.values():
-            if metrics["BMI"] <= 0:
-                metrics["BMI"] = round(median_bmi, 1)
+        """Replace any non-positive BMI values with the median BMI across patients."""
+        with self._get_connection() as conn:
+            rows = conn.execute("SELECT patient_id, BMI FROM patients").fetchall()
+            valid_bmis = [row["BMI"] for row in rows if row["BMI"] > 0]
+            median_bmi = round(statistics.median(valid_bmis), 1) if valid_bmis else 25.0
+
+            invalid_ids = [row["patient_id"] for row in rows if row["BMI"] <= 0]
+            if invalid_ids:
+                conn.executemany(
+                    "UPDATE patients SET BMI = ? WHERE patient_id = ?",
+                    [(median_bmi, pid) for pid in invalid_ids],
+                )
+                conn.commit()
 
     def get_all_ids(self) -> List[int]:
-        return sorted(self._raw_patients.keys())
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT patient_id FROM patients ORDER BY patient_id ASC"
+            ).fetchall()
+        return [row["patient_id"] for row in rows]
 
     def get_patient(self, patient_id: int) -> Optional[Dict[str, float]]:
-        patient = self._raw_patients.get(patient_id)
-        return patient.copy() if patient else None
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT Glucose, BMI, Age, BloodPressure FROM patients WHERE patient_id = ?",
+                (patient_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "Glucose": row["Glucose"],
+            "BMI": row["BMI"],
+            "Age": row["Age"],
+            "BloodPressure": row["BloodPressure"],
+        }
 
     def update_patient(self, patient_id: int, updated_metrics: Dict[str, float]) -> bool:
-        if patient_id in self._raw_patients:
-            self._raw_patients[patient_id].update(updated_metrics)
-            return True
-        return False
+        with self._get_connection() as conn:
+            existing = conn.execute(
+                "SELECT patient_id FROM patients WHERE patient_id = ?", (patient_id,)
+            ).fetchone()
+            if existing is None:
+                return False
 
+            columns = ", ".join(f"{col} = ?" for col in updated_metrics.keys())
+            values = list(updated_metrics.values()) + [patient_id]
+            conn.execute(
+                f"UPDATE patients SET {columns} WHERE patient_id = ?", values
+            )
+            conn.commit()
+        return True
 
 # =====================================================================
 # 2. BUSINESS LOGIC LAYER (SERVICE) - UNCHANGED
