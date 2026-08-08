@@ -254,10 +254,8 @@ class StreamlitController:
 # SYSTEM APPLICATION ENTRY POINT (Streamlit)
 # =====================================================================
 # Use session_state so the in-memory model persists across Streamlit reruns
-if "db_model" not in st.session_state:
-    st.session_state.db_model = PatientModel()
+db_model = PatientModel()
 
-db_model = st.session_state.db_model
 rules_service = ClinicalRiskService()
 ui_view = StreamlitView()
 
